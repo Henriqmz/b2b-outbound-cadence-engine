@@ -63,6 +63,7 @@ class CadenceEngine:
         raw_company: str,
         stage: str = "NEW",
         stage_updated_at: datetime | None = None,
+        draft_message: str | None = None,
     ) -> None:
         ts = (stage_updated_at or datetime.now(timezone.utc)).isoformat()
         canonical = resolve_canonical_company(raw_company)
@@ -70,10 +71,10 @@ class CadenceEngine:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO prospects
-                (prospect_id, account_owner, full_name, role_title, canonical_company, stage, stage_updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (prospect_id, account_owner, full_name, role_title, canonical_company, stage, draft_message, stage_updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (prospect_id, account_owner, full_name, role_title, canonical, stage, ts),
+                (prospect_id, account_owner, full_name, role_title, canonical, stage, draft_message, ts),
             )
 
     def run_daily_cycle(self, account_owner: str, now: datetime | None = None) -> CadenceRunStats:
@@ -160,3 +161,106 @@ class CadenceEngine:
                 (account_owner,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def list_prospects(
+        self,
+        account_owner: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if account_owner and account_owner != "all":
+            clauses.append("account_owner = ?")
+            params.append(account_owner)
+        if start_date:
+            clauses.append("substr(stage_updated_at, 1, 10) >= ?")
+            params.append(start_date)
+        if end_date:
+            clauses.append("substr(stage_updated_at, 1, 10) <= ?")
+            params.append(end_date)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM prospects {where_sql} ORDER BY stage_updated_at DESC, prospect_id ASC",
+                params,
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_quota_summary(self, account_owner: str, now: datetime | None = None) -> dict[str, Any]:
+        now_dt = now or datetime.now(timezone.utc)
+        today_prefix = now_dt.strftime("%Y-%m-%d")
+        week_cutoff = (now_dt - timedelta(days=7)).isoformat()
+        with self._connect() as conn:
+            if account_owner == "all":
+                daily_used = conn.execute(
+                    "SELECT COUNT(*) FROM prospects WHERE stage = 'INVITED' AND stage_updated_at LIKE ?",
+                    (f"{today_prefix}%",),
+                ).fetchone()[0]
+                weekly_used = conn.execute(
+                    "SELECT COUNT(*) FROM prospects WHERE stage != 'NEW' AND stage_updated_at >= ?",
+                    (week_cutoff,),
+                ).fetchone()[0]
+                daily_limit = self.daily_invite_quota * 2
+                weekly_limit = 400
+            else:
+                daily_used = conn.execute(
+                    "SELECT COUNT(*) FROM prospects WHERE account_owner = ? AND stage = 'INVITED' AND stage_updated_at LIKE ?",
+                    (account_owner, f"{today_prefix}%"),
+                ).fetchone()[0]
+                weekly_used = conn.execute(
+                    "SELECT COUNT(*) FROM prospects WHERE account_owner = ? AND stage != 'NEW' AND stage_updated_at >= ?",
+                    (account_owner, week_cutoff),
+                ).fetchone()[0]
+                daily_limit = self.daily_invite_quota
+                weekly_limit = 200
+        return {
+            "account_owner": account_owner,
+            "daily_used": int(daily_used),
+            "daily_limit": daily_limit,
+            "weekly_used": int(weekly_used),
+            "weekly_limit": weekly_limit,
+        }
+
+    def approve_draft(self, prospect_id: str, edited_message: str | None = None) -> dict[str, Any]:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM prospects WHERE prospect_id = ?", (prospect_id,)).fetchone()
+            if not row:
+                raise KeyError(prospect_id)
+            next_stage = "SENT_D1" if row["stage"] == "DRAFT_D1" else "SENT_D3"
+            msg = edited_message.strip() if edited_message is not None else (row["draft_message"] or "")
+            conn.execute(
+                "UPDATE prospects SET stage = ?, draft_message = ?, stage_updated_at = ? WHERE prospect_id = ?",
+                (next_stage, msg, now_iso, prospect_id),
+            )
+            return dict(conn.execute("SELECT * FROM prospects WHERE prospect_id = ?", (prospect_id,)).fetchone())
+
+    def promote_to_crm(self, prospect_id: str) -> dict[str, Any]:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM prospects WHERE prospect_id = ?", (prospect_id,)).fetchone()
+            if not row:
+                raise KeyError(prospect_id)
+            conn.execute(
+                "UPDATE prospects SET stage = 'CRM_SYNCED', stage_updated_at = ? WHERE prospect_id = ?",
+                (now_iso, prospect_id),
+            )
+            return dict(conn.execute("SELECT * FROM prospects WHERE prospect_id = ?", (prospect_id,)).fetchone())
+
+    def seed_demo_if_empty(self) -> None:
+        if self.list_prospects():
+            return
+        now = datetime.now(timezone.utc)
+        samples = [
+            ("P-101", "sdr_ana", "Carlos Mendes", "Diretor de Operações", "Acme Cloud Brasil Ltda", "NEW", now, None),
+            ("P-102", "sdr_ana", "Fernanda Lima", "Head de Produto", "Vortex Logistica S.A.", "INVITED", now - timedelta(hours=3), None),
+            ("P-103", "sdr_ana", "Juliana Rocha", "VP Comercial", "Acme Sistemas", "DRAFT_D1", now - timedelta(days=1), "Olá Juliana, obrigado pela conexão! Vi sua atuação como VP Comercial na Acme Cloud e gostaria de compartilhar um benchmark rápido do setor."),
+            ("P-104", "sdr_ana", "Pedro Costa", "CTO", "Vortex Transportes", "FOLLOWUP_D3", now - timedelta(days=3), "Olá Pedro, retomando rapidamente minha mensagem anterior — faz sentido conversarmos 10 min esta semana?"),
+            ("P-105", "sdr_ana", "Beatriz Nogueira", "Diretora Financeira", "Horizonte Varejo", "ACCEPTED", now - timedelta(days=2), None),
+            ("P-201", "sdr_lucas", "Rafael Gomes", "Gerente de Engenharia", "Nova Pay S.A.", "NEW", now, None),
+            ("P-202", "sdr_lucas", "Camila Duarte", "COO", "Vortex Logistica", "SENT_D1", now - timedelta(days=4), "Olá Camila, obrigado pela conexão!"),
+            ("P-203", "sdr_lucas", "Thiago Barros", "Head de Dados", "Acme Cloud Brasil", "CRM_SYNCED", now - timedelta(days=1), "Reunião agendada para quinta-feira às 15h."),
+        ]
+        for pid, owner, name, role, comp, stg, ts, draft in samples:
+            self.add_prospect(pid, owner, name, role, comp, stg, ts, draft_message=draft)

@@ -5,14 +5,23 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .cadence import CadenceEngine
+from .server import run_studio_server
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="B2B Outbound Cadence Engine")
-    parser.add_argument("--demo", action="store_true", help="Executa simulação de cadência D+1 / D+3")
+    parser.add_argument("--demo", action="store_true", help="Executa simulação CLI de cadência D+1 / D+3")
+    parser.add_argument("--serve", action="store_true", help="Inicia o painel web Kanban & Cadence Studio")
+    parser.add_argument("--port", type=int, default=8016, help="Porta HTTP do painel web (padrão: 8016)")
     args = parser.parse_args()
+
+    if args.serve:
+        engine = CadenceEngine(Path("data/cadence_studio.db"), daily_invite_quota=15)
+        run_studio_server(engine, port=args.port)
+        return
+
     if not args.demo:
-        print("Use --demo para simular a cadência outbound.")
+        print("Use --demo para simular no terminal ou --serve para abrir o Kanban Web Studio.")
         return
 
     now = datetime.now(timezone.utc)
